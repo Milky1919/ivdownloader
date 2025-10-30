@@ -23,9 +23,9 @@ app.use(express.static(path.join(__dirname, 'public')));
  * @returns {Promise<string|null>} The Base64 image string or null if not found.
  */
 const getImageBase64 = async (puppeteerPage, url, selector) => {
-    // 'domcontentloaded' is often more reliable for SPAs or pages with embedded content
-    // as it doesn't wait for all network requests to finish.
-    await puppeteerPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // Using 'networkidle0' is a safer bet to ensure all dynamic content,
+    // including the Base64 image source, is fully loaded.
+    await puppeteerPage.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
     await puppeteerPage.waitForSelector(selector, { timeout: 30000 });
     return puppeteerPage.evaluate((sel) => {
         const img = document.querySelector(sel);
@@ -151,12 +151,18 @@ app.post('/api/download-batch', async (req, res) => {
                 if (base64Image) {
                     images.push({ page, base64Image });
                 } else {
-                    failedPages.push(page);
+                    failedPages.push({ page, reason: 'Image source was empty.' });
                 }
-                await new Promise(resolve => setTimeout(resolve, 1500)); // Adjusted wait time
+                await new Promise(resolve => setTimeout(resolve, 1500));
             } catch (pageError) {
                 console.error(`Failed to fetch page ${page}:`, pageError.message);
-                failedPages.push(page);
+                let reason = 'Unknown error';
+                if (pageError.name === 'TimeoutError') {
+                    reason = 'Timeout waiting for page/selector.';
+                } else {
+                    reason = pageError.message;
+                }
+                failedPages.push({ page, reason });
             }
         }
 
@@ -164,9 +170,9 @@ app.post('/api/download-batch', async (req, res) => {
             return res.status(404).json({ error: 'No images could be downloaded.' });
         }
 
-        // Expose failed pages info to the client
+        // Expose detailed failed pages info to the client
         if (failedPages.length > 0) {
-            res.setHeader('X-Failed-Pages', failedPages.join(','));
+            res.setHeader('X-Failed-Pages', JSON.stringify(failedPages));
             res.setHeader('Access-Control-Expose-Headers', 'X-Failed-Pages');
         }
 

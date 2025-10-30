@@ -6,26 +6,29 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Helper function to update status
     const updateStatus = (message, isError = false) => {
-        statusArea.innerHTML = message; // Use innerHTML to allow line breaks
+        statusArea.textContent = message;
         statusArea.style.color = isError ? 'red' : 'black';
     };
 
     // Helper function to handle fetch response for file download
     const handleFileResponse = async (response) => {
         if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || 'Unknown error occurred.');
+            try {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'An unknown error occurred.');
+            } catch (jsonError) {
+                // If the response is not JSON, use the status text.
+                throw new Error(`Server returned an error: ${response.status} ${response.statusText}`);
+            }
         }
 
         const disposition = response.headers.get('content-disposition');
         let filename = 'downloaded_file';
         if (disposition) {
-            // Support for RFC 5987 `filename*=` (for UTF-8)
             const utf8FilenameMatch = disposition.match(/filename\*=UTF-8''(.+)/);
             if (utf8FilenameMatch && utf8FilenameMatch[1]) {
                 filename = decodeURIComponent(utf8FilenameMatch[1]);
             } else {
-                // Fallback to `filename=`
                 const asciiFilenameMatch = disposition.match(/filename="(.+?)"/);
                 if (asciiFilenameMatch && asciiFilenameMatch[1]) {
                     filename = asciiFilenameMatch[1];
@@ -33,7 +36,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        const failedPages = response.headers.get('X-Failed-Pages');
+        const failedPagesHeader = response.headers.get('X-Failed-Pages');
 
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
@@ -45,7 +48,7 @@ document.addEventListener('DOMContentLoaded', () => {
         a.remove();
         window.URL.revokeObjectURL(url);
 
-        return { failedPages };
+        return { failedPagesHeader };
     };
 
     // Test Download Logic
@@ -108,11 +111,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify(data)
             });
 
-            const { failedPages } = await handleFileResponse(response);
+            const { failedPagesHeader } = await handleFileResponse(response);
 
             let statusMessage = 'Batch download completed successfully!';
-            if (failedPages) {
-                statusMessage += `<br><b>Warning:</b> Could not download the following pages: ${failedPages}`;
+            if (failedPagesHeader) {
+                try {
+                    const failedPages = JSON.parse(failedPagesHeader);
+                    if (failedPages.length > 0) {
+                        statusMessage += `\n\nWarning: Could not download the following pages:`;
+                        failedPages.forEach(p => {
+                            statusMessage += `\n- Page ${p.page}: ${p.reason}`;
+                        });
+                    }
+                } catch (e) {
+                     statusMessage += `\n\nWarning: Could not parse failed pages data.`;
+                }
             }
             updateStatus(statusMessage);
 
