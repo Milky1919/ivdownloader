@@ -3,6 +3,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const testButton = document.getElementById('test_button');
     const batchButton = document.getElementById('batch_button');
     const statusArea = document.getElementById('status_area');
+    const allFormControls = [
+        testButton,
+        batchButton,
+        ...Array.from(form.querySelectorAll('input, button, radio'))
+    ];
+
+    // Helper function to enable/disable all UI controls
+    const setUIEnabled = (isEnabled) => {
+        allFormControls.forEach(control => {
+            control.disabled = !isEnabled;
+        });
+    };
 
     // Helper function to update status
     const updateStatus = (message, isError = false) => {
@@ -72,6 +84,7 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         updateStatus(`Downloading test page ${data.page}...`);
+        setUIEnabled(false);
 
         try {
             const response = await fetch('/api/download-single', {
@@ -83,6 +96,8 @@ document.addEventListener('DOMContentLoaded', () => {
             updateStatus(`Successfully downloaded page ${data.page}.`);
         } catch (error) {
             updateStatus(`Error: ${error.message}`, true);
+        } finally {
+            setUIEnabled(true);
         }
     });
 
@@ -94,15 +109,71 @@ document.addEventListener('DOMContentLoaded', () => {
             pdf: formData.get('pdf'),
             page_range: formData.get('page_range'),
             selector: formData.get('selector'),
-            output_format: formData.get('output_format')
+            output_format: formData.get('output_format'),
+            clientId: `client-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
         };
 
         if (!data.group_name || !data.pdf || !data.page_range) {
-             updateStatus('Please fill in all required fields.', true);
-             return;
+            updateStatus('Please fill in all required fields.', true);
+            return;
         }
 
-        updateStatus('Starting batch download... This may take a while.');
+        // Setup SSE connection
+        const eventSource = new EventSource(`/api/progress?clientId=${data.clientId}`);
+        const progressContainer = document.getElementById('progress_container');
+        const progressBar = document.getElementById('progress_bar');
+        const logArea = document.getElementById('log_area');
+
+        progressContainer.style.display = 'block';
+        logArea.innerHTML = ''; // Clear previous logs
+        progressBar.value = 0;
+        updateStatus('Starting batch download...');
+        setUIEnabled(false);
+
+        const closeConnection = () => {
+            if (eventSource.readyState !== EventSource.CLOSED) {
+                eventSource.close();
+            }
+            setUIEnabled(true);
+            // Hide progress bar after a short delay to allow user to see the final status
+            setTimeout(() => {
+                progressContainer.style.display = 'none';
+            }, 5000);
+        };
+
+        eventSource.onmessage = (event) => {
+            const progressData = JSON.parse(event.data);
+            if (progressData.type === 'progress') {
+                progressBar.value = progressData.value;
+            } else if (progressData.type === 'log') {
+                const logEntry = document.createElement('div');
+                logEntry.textContent = progressData.message;
+                if (progressData.isError) {
+                    logEntry.style.color = 'red';
+                }
+                logArea.appendChild(logEntry);
+                logArea.scrollTop = logArea.scrollHeight; // Auto-scroll
+            } else if (progressData.type === 'complete') {
+                let statusMessage = 'Batch download processing finished!';
+                 if (progressData.failedPages && progressData.failedPages.length > 0) {
+                    statusMessage += `\nWarning: Could not download the following pages:`;
+                    progressData.failedPages.forEach(p => {
+                        statusMessage += `\n- Page ${p.page}: ${p.reason}`;
+                    });
+                }
+                updateStatus(statusMessage);
+                closeConnection();
+            } else if (progressData.type === 'error') {
+                 updateStatus(`An error occurred on the server: ${progressData.message}`, true);
+                 closeConnection();
+            }
+        };
+
+        eventSource.onerror = () => {
+            updateStatus('Connection to server progress updates failed. The download may still be running.', true);
+            closeConnection();
+        };
+
 
         try {
             const response = await fetch('/api/download-batch', {
@@ -110,27 +181,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)
             });
-
-            const { failedPagesHeader } = await handleFileResponse(response);
-
-            let statusMessage = 'Batch download completed successfully!';
-            if (failedPagesHeader) {
-                try {
-                    const failedPages = JSON.parse(failedPagesHeader);
-                    if (failedPages.length > 0) {
-                        statusMessage += `\n\nWarning: Could not download the following pages:`;
-                        failedPages.forEach(p => {
-                            statusMessage += `\n- Page ${p.page}: ${p.reason}`;
-                        });
-                    }
-                } catch (e) {
-                     statusMessage += `\n\nWarning: Could not parse failed pages data.`;
-                }
-            }
-            updateStatus(statusMessage);
-
+            // The actual file download is handled here, after SSE logs are complete.
+            await handleFileResponse(response);
         } catch (error) {
             updateStatus(`Error: ${error.message}`, true);
+            closeConnection();
         }
     });
 });

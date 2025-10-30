@@ -30,22 +30,33 @@ const getImageBase64 = async (puppeteerPage, url, selector, pageNumber) => {
     await puppeteerPage.waitForSelector(selector, { timeout: 30000 });
 
     return puppeteerPage.evaluate((sel, pNum) => {
-        const images = Array.from(document.querySelectorAll(sel));
-        const imageSources = images.map(img => img.src).filter(src => src.startsWith('data:image'));
+        const imageElements = document.querySelectorAll(sel);
+        // Filter for elements that are actual images with a data URI source.
+        const dataImageSources = Array.from(imageElements)
+            .map(img => img.src)
+            .filter(src => src && src.startsWith('data:image'));
 
-        switch (imageSources.length) {
-            case 1: // Single page view
-                return imageSources[0];
-            case 2: // Spread view
-                if (pNum % 2 === 0) { // Even page (left side)
-                    return imageSources[0];
-                } else { // Odd page (right side)
-                    return imageSources[1];
-                }
-            default: // Unexpected number of images
-                console.error(`Found ${imageSources.length} images, expected 1 or 2.`);
-                return null;
+        const numImages = dataImageSources.length;
+
+        // Requirement: Handle single page view
+        if (numImages === 1) {
+            return dataImageSources[0];
         }
+
+        // Requirement: Handle spread view (2 images)
+        if (numImages === 2) {
+            // On a spread, an even page number corresponds to the left image (index 0)
+            // and an odd page number to the right image (index 1).
+            if (pNum % 2 === 0) { // Even page number
+                return dataImageSources[0]; // Return first image
+            } else { // Odd page number
+                return dataImageSources[1]; // Return second image
+            }
+        }
+
+        // Requirement: Handle error cases (0, 3, or more images)
+        console.error(`Found ${numImages} images for selector '${sel}' on page ${pNum}, but expected 1 or 2.`);
+        return null;
     }, selector, pageNumber);
 };
 
@@ -135,11 +146,52 @@ app.post('/api/download-single', async (req, res) => {
     }
 });
 
+// --- SSE Global State ---
+// Caution: This is a simple in-memory solution. In a real-world, scalable application,
+// you would use a more robust solution like Redis or a dedicated message broker.
+const sseClients = new Map();
+
+// --- Server-Sent Events (SSE) Endpoint ---
+app.get('/api/progress', (req, res) => {
+    // A unique ID for each client is essential for targeted updates.
+    const clientId = req.query.clientId;
+    if (!clientId) {
+        res.status(400).send('clientId is required');
+        return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    sseClients.set(clientId, res);
+    console.log(`Client connected for SSE: ${clientId}`);
+
+    req.on('close', () => {
+        sseClients.delete(clientId);
+        console.log(`Client disconnected from SSE: ${clientId}`);
+    });
+});
+
+/**
+ * Sends a progress update to a specific client via SSE.
+ * @param {string} clientId - The unique identifier for the client.
+ * @param {object} data - The data payload to send.
+ */
+const sendProgress = (clientId, data) => {
+    const client = sseClients.get(clientId);
+    if (client) {
+        client.write(`data: ${JSON.stringify(data)}\n\n`);
+    }
+};
+
+
 // Batch download endpoint
 app.post('/api/download-batch', async (req, res) => {
-    const { group_name, pdf, page_range, selector, output_format } = req.body;
+    const { group_name, pdf, page_range, selector, output_format, clientId } = req.body;
 
-    if (!group_name || !pdf || !page_range || !selector || !output_format) {
+    if (!group_name || !pdf || !page_range || !selector || !output_format || !clientId) {
         return res.status(400).json({ error: 'Missing required parameters.' });
     }
 
@@ -160,27 +212,42 @@ app.post('/api/download-batch', async (req, res) => {
 
         const images = [];
         const failedPages = [];
-        for (const page of pages) {
+        const totalPages = pages.length;
+
+        for (let i = 0; i < totalPages; i++) {
+            const page = pages[i];
+            const progress = Math.round(((i + 1) / totalPages) * 100);
             const url = `https://viewer.impress.co.jp/viewer.html?group_name=${group_name}&pdf=${pdf}&page=${page}`;
+
+            sendProgress(clientId, { type: 'log', message: `Fetching page ${page} (${i + 1}/${totalPages})...` });
+
             try {
                 const base64Image = await getImageBase64(puppeteerPage, url, selector, page);
                 if (base64Image) {
                     images.push({ page, base64Image });
+                    sendProgress(clientId, { type: 'log', message: `Successfully fetched page ${page}.` });
                 } else {
-                    failedPages.push({ page, reason: 'Image source was empty.' });
+                    const reason = 'Image source was empty or not found.';
+                    failedPages.push({ page, reason });
+                    sendProgress(clientId, { type: 'log', message: `Failed to fetch page ${page}: ${reason}`, isError: true });
                 }
+                 // Keep a delay to avoid overwhelming the server
                 await new Promise(resolve => setTimeout(resolve, 1500));
+
             } catch (pageError) {
                 console.error(`Failed to fetch page ${page}:`, pageError.message);
-                let reason = 'Unknown error';
+                let reason = pageError.message;
                 if (pageError.name === 'TimeoutError') {
                     reason = 'Timeout waiting for page/selector.';
-                } else {
-                    reason = pageError.message;
                 }
                 failedPages.push({ page, reason });
+                sendProgress(clientId, { type: 'log', message: `Failed to fetch page ${page}: ${reason}`, isError: true });
             }
+
+            sendProgress(clientId, { type: 'progress', value: progress });
         }
+
+        sendProgress(clientId, { type: 'log', message: 'All pages processed. Compiling output file...' });
 
         if (images.length === 0) {
             return res.status(404).json({ error: 'No images could be downloaded.' });
@@ -237,8 +304,11 @@ app.post('/api/download-batch', async (req, res) => {
             res.send(Buffer.from(pdfBytes));
         }
 
+        sendProgress(clientId, { type: 'complete', failedPages });
+
     } catch (error) {
         console.error('Error during batch download:', error);
+        sendProgress(clientId, { type: 'error', message: error.message });
         res.status(500).json({ error: `An error occurred: ${error.message}` });
     } finally {
         if (browser) {
