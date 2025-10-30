@@ -16,21 +16,37 @@ app.use(express.static(path.join(__dirname, 'public')));
 // --- Helper Functions ---
 
 /**
- * Fetches the Base64 source of an image from a given URL using Puppeteer.
+ * Fetches the Base64 source of an image from a given URL using Puppeteer, handling spread view.
  * @param {object} puppeteerPage - The Puppeteer page object.
  * @param {string} url - The URL to navigate to.
  * @param {string} selector - The CSS selector for the image.
+ * @param {number} pageNumber - The requested page number.
  * @returns {Promise<string|null>} The Base64 image string or null if not found.
  */
-const getImageBase64 = async (puppeteerPage, url, selector) => {
+const getImageBase64 = async (puppeteerPage, url, selector, pageNumber) => {
     // Using 'networkidle0' is a safer bet to ensure all dynamic content,
     // including the Base64 image source, is fully loaded.
     await puppeteerPage.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
     await puppeteerPage.waitForSelector(selector, { timeout: 30000 });
-    return puppeteerPage.evaluate((sel) => {
-        const img = document.querySelector(sel);
-        return img ? img.src : null;
-    }, selector);
+
+    return puppeteerPage.evaluate((sel, pNum) => {
+        const images = Array.from(document.querySelectorAll(sel));
+        const imageSources = images.map(img => img.src).filter(src => src.startsWith('data:image'));
+
+        switch (imageSources.length) {
+            case 1: // Single page view
+                return imageSources[0];
+            case 2: // Spread view
+                if (pNum % 2 === 0) { // Even page (left side)
+                    return imageSources[0];
+                } else { // Odd page (right side)
+                    return imageSources[1];
+                }
+            default: // Unexpected number of images
+                console.error(`Found ${imageSources.length} images, expected 1 or 2.`);
+                return null;
+        }
+    }, selector, pageNumber);
 };
 
 /**
@@ -92,7 +108,7 @@ app.post('/api/download-single', async (req, res) => {
         }
         browser = await puppeteer.launch(launchOptions);
         const puppeteerPage = await browser.newPage();
-        const base64Image = await getImageBase64(puppeteerPage, url, selector);
+        const base64Image = await getImageBase64(puppeteerPage, url, selector, page);
 
         if (!base64Image) {
             return res.status(404).json({ error: 'Image selector not found or image has no src.' });
@@ -147,7 +163,7 @@ app.post('/api/download-batch', async (req, res) => {
         for (const page of pages) {
             const url = `https://viewer.impress.co.jp/viewer.html?group_name=${group_name}&pdf=${pdf}&page=${page}`;
             try {
-                const base64Image = await getImageBase64(puppeteerPage, url, selector);
+                const base64Image = await getImageBase64(puppeteerPage, url, selector, page);
                 if (base64Image) {
                     images.push({ page, base64Image });
                 } else {
