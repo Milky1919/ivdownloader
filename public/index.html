@@ -121,6 +121,13 @@
         <div id="status_area">
             Ready.
         </div>
+
+        <!-- Progress Bar and Log Area -->
+        <div id="progress_container" style="display: none;">
+            <label for="progress_bar">Overall Progress:</label>
+            <progress id="progress_bar" value="0" max="100" style="width: 100%;"></progress>
+            <div id="log_area" style="height: 150px; overflow-y: scroll; background-color: #f0f0f0; border: 1px solid #ccc; padding: 10px; margin-top: 10px; font-family: monospace; font-size: 0.9em;"></div>
+        </div>
     </div>
 
     <script src="script.js"></script>
