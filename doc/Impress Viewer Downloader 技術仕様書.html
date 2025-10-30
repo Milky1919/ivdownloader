@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>技術仕様書: Impress Viewer ダウンローダー</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            background-color: #f9f9f9;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+        }
+        h1, h2, h3, h4 {
+            font-weight: 600;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 8px;
+            margin-top: 25px;
+        }
+        h1 {
+            font-size: 2.2em;
+            color: #2c3e50;
+            border-bottom-color: #2c3e50;
+        }
+        h2 {
+            font-size: 1.8em;
+            color: #34495e;
+            margin-top: 40px;
+        }
+        h3 {
+            font-size: 1.4em;
+            color: #34495e;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        li {
+            margin-bottom: 10px;
+        }
+        .note {
+            background-color: #fff9e6;
+            border-left: 4px solid #f7b731;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        pre {
+            background-color: #f3f4f6;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            color: #d6336c;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>技術仕様書: Impress Viewer ダウンローダー</h1>
+
+        <h2>1. 概要</h2>
+        <p>Impress社のWebブックビューア（viewer.impress.co.jp）から、指定されたBase64エンコード画像を抽出し、デコードして一括ダウンロードするWebアプリケーション。</p>
+        <p>ユーザーは対象の `group_name`, `pdf` パラメータ、ページ範囲、および最終出力フォーマット（ZIPまたはPDF）を指定できる。アプリケーションは、サーバーサイドのヘッドレスブラウザを使用して対象ページにアクセスし、JavaScript実行後の画像データを取得する。</p>
+        <p><strong>本書は実装の詳細（コード）を含まず、要求される機能と仕様のみを定義する。</strong></p>
+
+        <h2>2. システム構成</h2>
+        <p>本システムは、以下の2つのコンポーネントで構成される。</p>
+        <ul>
+            <li><strong>フロントエンド:</strong> ユーザーインターフェース（UI）を提供する単一のHTML/CSS/JavaScriptファイル。</li>
+            <li><strong>バックエンド:</strong> 実際のクロール処理、画像デコード、ZIP/PDF生成を実行するサーバーアプリケーション。</li>
+        </ul>
+
+        <h2>3. 推奨技術スタック</h2>
+        <p>（これは推奨であり、開発者の判断で変更可能）</p>
+        <ul>
+            <li><strong>バックエンド (サーバーサイド):</strong> Node.js (Express, Fastify 等のフレームワーク)</li>
+            <li><strong>ヘッドレスブラウザ (必須):</strong> Puppeteer または Playwright</li>
+            <li><strong>ZIP圧縮ライブラリ:</strong> `archiver` (Node.js) または同等の機能を持つもの</li>
+            <li><strong>PDF生成ライブラリ:</strong> `pdf-lib` (Node.js) または同等の機能を持つもの</li>
+            <li><strong>フロントエンド:</strong> HTML, CSS, クライアントサイドJavaScript (Fetch API使用)</li>
+        </ul>
+
+        <h2>4. 機能要件 (フロントエンド UI)</h2>
+        <p>UIは以下の入力フィールドとアクションボタンを提供すること。</p>
+
+        <h3>4.1. フォーム: パラメータ入力</h3>
+        <ul>
+            <li><strong>Group Name (必須):</strong> 
+                <ul>
+                    <li>ID (例): `group_name_input`</li>
+                    <li>型: テキスト入力</li>
+                    <li>説明: URLの `group_name` パラメータに該当。</li>
+                </ul>
+            </li>
+            <li><strong>PDF ID (必須):</strong>
+                <ul>
+                    <li>ID (例): `pdf_input`</li>
+                    <li>型: テキスト入力</li>
+                    <li>説明: URLの `pdf` パラメータに該当。</li>
+                </ul>
+            </li>
+            <li><strong>ページ範囲 (必須):</strong>
+                <ul>
+                    <li>ID (例): `page_range_input`</li>
+                    <li>型: テキスト入力</li>
+                    <li>説明: ダウンロードしたいページの範囲。単一（例: `5`）または範囲（例: `1-10`）で指定。</li>
+                </ul>
+            </li>
+            <li><strong>画像セレクタ (変更可):</strong>
+                <ul>
+                    <li>ID (例): `selector_input`</li>
+                    <li>型: テキスト入力</li>
+                    <li>説明: 抽出対象のBase64画像を指定するCSSセレクタ。開発者が最適なものをデフォルト値として設定する。（推奨デフォルト値: `div.slick-current img[src^="data:image"]`）</li>
+                </ul>
+            </li>
+            <li><strong>出力フォーマット (一括時):</strong>
+                <ul>
+                    <li>ID (例): `format_select`</li>
+                    <li>型: ラジオボタンまたはセレクトボックス</li>
+                    <li>オプション: 
+                        <ol>
+                            <li>ZIP (デフォルト)</li>
+                            <li>PDF</li>
+                        </ol>
+                    </li>
+                    <li>説明: 一括ダウンロード時のファイル形式。</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h3>4.2. アクション</h3>
+        <ul>
+            <li><strong>テストダウンロード (ボタン):</strong>
+                <ul>
+                    <li>ID (例): `test_button`</li>
+                    <li>動作: 「ページ範囲」入力欄の *最初のページ番号* のみを取得し、後述の <strong>`/api/download-single`</strong> エンドポイントにリクエストを送信する。</li>
+                </ul>
+            </li>
+            <li><strong>一括ダウンロード (ボタン):</strong>
+                <ul>
+                    <li>ID (例): `batch_button`</li>
+                    <li>動作: 「ページ範囲」と「出力フォーマット」を取得し、後述の <strong>`/api/download-batch`</strong> エンドポイントにリクエストを送信する。</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h3>4.3. フィードバック</h3>
+        <ul>
+            <li><strong>ステータス表示エリア:</strong>
+                <ul>
+                    <li>ID (例): `status_area`</li>
+                    <li>動作: 「処理中...」「ページ 5/20 を取得中...」「PDFを生成しています...」「エラー: ページ 8 が見つかりません」など、サーバーからの進捗や結果を表示する領域。</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h2>5. 機能要件 (バックエンド API)</h2>
+        <p>バックエンドは、フロントエンドからのリクエストを処理するHTTPサーバーとして機能する。</p>
+
+        <h3>5.1. エンドポイント: <code>/api/download-single</code> (テスト用)</h3>
+        <ul>
+            <li><strong>HTTPメソッド:</strong> POST</li>
+            <li><strong>リクエスト (JSON):</strong>
+                <pre>{
+    "group_name": "...",
+    "pdf": "...",
+    "page": 5,
+    "selector": "div.slick-current img[src^=\"data:image\"]"
+}</pre>
+            </li>
+            <li><strong>処理内容:</strong>
+                <ol>
+                    <li>リクエストからパラメータを取得。</li>
+                    <li>対象URL（`page=5`）を構築。</li>
+                    <li>ヘッドレスブラウザ（Puppeteer等）でURLにアクセス。</li>
+                    <li>指定された `selector` が表示されるまで待機（`waitForSelector`）。</li>
+                    <li>該当する `img` タグの `src` 属性（Base64データ）を取得。</li>
+                    <li>Base64データをデコードし、画像バイナリを生成。</li>
+                    <li>画像バイナリをレスポンスとして返す。</li>
+                </ol>
+            </li>
+            <li><strong>成功レスポンス:</strong>
+                <ul>
+                    <li>HTTPステータス: 200 OK</li>
+                    <li>Content-Type: `image/jpeg`（または抽出画像のMIMEタイプ）</li>
+                    <li>Content-Disposition: `attachment; filename="page_5.jpg"`</li>
+                    <li>ボディ: 画像バイナリデータ</li>
+                </ul>
+            </li>
+            <li><strong>失敗レスポンス:</strong>
+                <ul>
+                    <li>HTTPステータス: 400 (不正なリクエスト), 404 (画像セレクタ見つからず), 500 (サーバーエラー)</li>
+                    <li>Content-Type: `application/json`</li>
+                    <li>ボディ: `{ "error": "エラーメッセージ" }`</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h3>5.2. エンドポイント: <code>/api/download-batch</code> (一括処理)</h3>
+        <ul>
+            <li><strong>HTTPメソッド:</strong> POST</li>
+            <li><strong>リクエスト (JSON):</strong>
+                <pre>{
+    "group_name": "...",
+    "pdf": "...",
+    "page_range": "1-10",
+    "selector": "...",
+    "output_format": "zip" 
+}</pre>
+            </li>
+            <li><strong>処理内容:</strong>
+                <ol>
+                    <li>リクエストからパラメータ（`output_format` を含む）を取得。</li>
+                    <li>`page_range`（例: "1-10"）を解析し、処理対象のページ番号リスト（`[1, 2, ..., 10]`）を生成する。</li>
+                    <li>ヘッドレスブラウザを起動。単一のブラウザインスタンスとページオブジェクトを再利用することが望ましい。</li>
+                    <li>ページ番号リストをループ処理:
+                        <ol>
+                            <li>対象URL（`page=N`）を構築。</li>
+                            <li>ページにアクセス（`page.goto`）。</li>
+                            <li>指定された `selector` が表示されるまで待機。</li>
+                            <li>`src` 属性（Base64データ）を取得。</li>
+                            <li>Base64データをデコードし、画像バイナリを生成。</li>
+                            <li>（処理A）`output_format` が "zip" の場合: 画像バイナリを `page_N.jpg` 等のファイル名でZIPアーカイブに追加する。</li>
+                            <li>（処理B）`output_format` が "pdf" の場合: 画像バイナリをPDFドキュメントオブジェクトにページとして追加する。</li>
+                            <li>サーバー負荷軽減のため、各リクエスト間に適切な待機時間（例: 1〜3秒）を挿入する。</li>
+                        </ol>
+                    </li>
+                    <li>`output_format` に応じて最終ファイルを生成（ZIPのファイナライズ、またはPDFドキュメントのビルド）。</li>
+                    <li>完成したファイルをレスポンスとして返す。</li>
+                </ol>
+            </li>
+            <li><strong>成功レスポンス (ZIPの場合):</strong>
+                <ul>
+                    <li>HTTPステータス: 200 OK</li>
+                    <li>Content-Type: `application/zip`</li>
+                    <li>Content-Disposition: `attachment; filename="{group_name}.zip"`</li>
+                    <li>ボディ: ZIPファイルのバイナリデータ</li>
+                </ul>
+            </li>
+            <li><strong>成功レスポンス (PDFの場合):</strong>
+                <ul>
+                    <li>HTTPステータス: 200 OK</li>
+                    <li>Content-Type: `application/pdf`</li>
+                    <li>Content-Disposition: `attachment; filename="{group_name}.pdf"`</li>
+                    <li>ボディ: PDFファイルのバイナリデータ</li>
+                </ul>
+            </li>
+            <li><strong>失敗レスポンス:</strong>
+                <ul>
+                    <li>(単一ダウンロードと同様のエラーハンドリング)</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h2>6. 実装上の考慮事項</h2>
+        <ul>
+            <li><strong>動的待機処理:</strong> 
+                <p>対象サイトは `page` パラメータを変更してもページ全体をリロードしない（SPA動作）可能性がある。その場合、`page.goto()` をループで呼び出すのではなく、URLのハッシュ変更やページネーションボタンのクリックをエミュレートし、「`img`タグの`src`属性が *変更* されるまで」待機する、より高度な制御ロジックが必要になる場合がある。</p>
+            </li>
+            <li><strong>サーバー負荷軽減:</strong> 
+                <p>対象サーバーへの短時間での連続アクセスは避けること。一括ダウンロードのループ処理には、必ず 1〜3秒程度の待機時間（`sleep`処理）を挿入し、倫理的なクローリングを実装すること。</p>
+            </li>
+            <li><strong>エラーハンドリング:</strong>
+                <p>指定したページが存在しない、画像セレクタがタイムアウトする、Base64データが取得できない等、ループ処理中に一部のページでエラーが発生しても、処理全体が停止しないように設計すること。失敗したページはログに出力し、取得できた画像のみで最終ファイル（ZIP/PDF）を生成することが望ましい。</p>
+            </li>
+            <li><strong>タイムアウト設定:</strong>
+                <p>Puppeteerの `goto` および `waitForSelector` には、長すぎず短すぎない適切なタイムアウト値（例: 30秒）を設定すること。</p>
+            </li>
+            <li><strong>Base64デコード:</strong>
+                <p>`src` 属性から取得したデータ（例: `data:image/jpeg;base64,ABC...`）から、ヘッダー（`data:image/jpeg;base64,`）を正規表現または文字列置換で正確に除去した上で、Base64デコード処理を行うこと。</p>
+            </li>
+            <li><strong>PDF生成:</strong>
+                <p>PDF生成ライブラリ（`pdf-lib`等）を使用する場合、取得した画像（JPEG等）をPDFページに埋め込む処理が必要となる。画像の寸法（解像度）を取得し、PDFのページサイズを画像サイズに合わせる処理を実装すること。</p>
+            </li>
+        </ul>
+    </div>
+</body>
+</html>
+
