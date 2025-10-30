@@ -23,7 +23,9 @@ app.use(express.static(path.join(__dirname, 'public')));
  * @returns {Promise<string|null>} The Base64 image string or null if not found.
  */
 const getImageBase64 = async (puppeteerPage, url, selector) => {
-    await puppeteerPage.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+    // 'domcontentloaded' is often more reliable for SPAs or pages with embedded content
+    // as it doesn't wait for all network requests to finish.
+    await puppeteerPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await puppeteerPage.waitForSelector(selector, { timeout: 30000 });
     return puppeteerPage.evaluate((sel) => {
         const img = document.querySelector(sel);
@@ -46,6 +48,27 @@ const parsePageRange = (rangeStr) => {
     return isNaN(page) ? [] : [page];
 };
 
+/**
+ * Extracts components from a Base64 data URI.
+ * @param {string} dataURI - The Base64 data URI.
+ * @returns {{mimeType: string, extension: string, data: string}|null}
+ */
+const parseDataURI = (dataURI) => {
+    const match = dataURI.match(/^data:(image\/(.+?));base64,(.*)$/);
+    if (!match) return null;
+
+    const mimeType = match[1];
+    let extension = match[2];
+    // Handle complex mime types like 'svg+xml' -> 'svg'
+    if (extension.includes('+')) {
+        extension = extension.split('+')[0];
+    }
+     // Simple sanitization
+    extension = extension.replace(/[^a-zA-Z0-9]/g, '');
+
+    return { mimeType, extension, data: match[3] };
+};
+
 
 // --- API Endpoints ---
 
@@ -57,11 +80,17 @@ app.post('/api/download-single', async (req, res) => {
         return res.status(400).json({ error: 'Missing required parameters.' });
     }
 
-    const url = `https://viewer.impress.co.jp/books/${group_name}/${pdf}/index.html?page=${page}`;
+    const url = `https://viewer.impress.co.jp/viewer.html?group_name=${group_name}&pdf=${pdf}&page=${page}`;
     let browser = null;
 
     try {
-        browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        const launchOptions = {};
+        // --no-sandbox is required for running in containerized environments (e.g., Docker).
+        // Use an environment variable to control this for flexibility.
+        if (process.env.PUPPETEER_NO_SANDBOX) {
+            launchOptions.args = ['--no-sandbox', '--disable-setuid-sandbox'];
+        }
+        browser = await puppeteer.launch(launchOptions);
         const puppeteerPage = await browser.newPage();
         const base64Image = await getImageBase64(puppeteerPage, url, selector);
 
@@ -69,17 +98,15 @@ app.post('/api/download-single', async (req, res) => {
             return res.status(404).json({ error: 'Image selector not found or image has no src.' });
         }
 
-        const matches = base64Image.match(/^data:(image\/([a-zA-Z]+));base64,(.*)$/);
-        if (!matches || matches.length !== 4) {
-             return res.status(500).json({ error: 'Invalid Base64 image format.' });
+        const imageInfo = parseDataURI(base64Image);
+        if (!imageInfo) {
+            return res.status(500).json({ error: 'Invalid Base64 image format.' });
         }
 
-        const imageMimeType = `image/${matches[2]}`;
-        const imageData = matches[3];
-        const buffer = Buffer.from(imageData, 'base64');
+        const buffer = Buffer.from(imageInfo.data, 'base64');
 
-        res.setHeader('Content-Type', imageMimeType);
-        res.setHeader('Content-Disposition', `attachment; filename="page_${page}.${matches[2]}"`);
+        res.setHeader('Content-Type', imageInfo.mimeType);
+        res.setHeader('Content-Disposition', `attachment; filename="page_${page}.${imageInfo.extension}"`);
         res.send(buffer);
 
     } catch (error) {
@@ -108,25 +135,39 @@ app.post('/api/download-batch', async (req, res) => {
     let browser = null;
 
     try {
-        browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        const launchOptions = {};
+        if (process.env.PUPPETEER_NO_SANDBOX) {
+            launchOptions.args = ['--no-sandbox', '--disable-setuid-sandbox'];
+        }
+        browser = await puppeteer.launch(launchOptions);
         const puppeteerPage = await browser.newPage();
 
         const images = [];
+        const failedPages = [];
         for (const page of pages) {
-            const url = `https://viewer.impress.co.jp/books/${group_name}/${pdf}/index.html?page=${page}`;
+            const url = `https://viewer.impress.co.jp/viewer.html?group_name=${group_name}&pdf=${pdf}&page=${page}`;
             try {
                 const base64Image = await getImageBase64(puppeteerPage, url, selector);
                 if (base64Image) {
                     images.push({ page, base64Image });
+                } else {
+                    failedPages.push(page);
                 }
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                await new Promise(resolve => setTimeout(resolve, 1500)); // Adjusted wait time
             } catch (pageError) {
                 console.error(`Failed to fetch page ${page}:`, pageError.message);
+                failedPages.push(page);
             }
         }
 
         if (images.length === 0) {
             return res.status(404).json({ error: 'No images could be downloaded.' });
+        }
+
+        // Expose failed pages info to the client
+        if (failedPages.length > 0) {
+            res.setHeader('X-Failed-Pages', failedPages.join(','));
+            res.setHeader('Access-Control-Expose-Headers', 'X-Failed-Pages');
         }
 
         if (output_format === 'zip') {
@@ -135,11 +176,10 @@ app.post('/api/download-batch', async (req, res) => {
             const archive = archiver('zip', { zlib: { level: 9 } });
             archive.pipe(res);
             for (const img of images) {
-                const matches = img.base64Image.match(/^data:image\/([a-zA-Z]+);base64,(.*)$/);
-                if (matches) {
-                    const imageType = matches[1];
-                    const buffer = Buffer.from(matches[2], 'base64');
-                    archive.append(buffer, { name: `page_${img.page}.${imageType.split('/')[1]}` });
+                const imageInfo = parseDataURI(img.base64Image);
+                if (imageInfo) {
+                    const buffer = Buffer.from(imageInfo.data, 'base64');
+                    archive.append(buffer, { name: `page_${img.page}.${imageInfo.extension}` });
                 }
             }
             await archive.finalize();
@@ -147,25 +187,26 @@ app.post('/api/download-batch', async (req, res) => {
         } else if (output_format === 'pdf') {
             const pdfDoc = await PDFDocument.create();
             for (const img of images) {
-                const matches = img.base64Image.match(/^data:image\/([a-zA-Z]+);base64,(.*)$/);
-                if (matches) {
-                    const imageType = matches[1];
-                    const buffer = Buffer.from(matches[2], 'base64');
+                const imageInfo = parseDataURI(img.base64Image);
+                if (!imageInfo) continue;
 
+                try {
+                    const buffer = Buffer.from(imageInfo.data, 'base64');
                     let image;
-                    if (imageType === 'image/png') {
-                         image = await pdfDoc.embedPng(buffer);
+                    if (imageInfo.mimeType === 'image/png') {
+                        image = await pdfDoc.embedPng(buffer);
+                    } else if (imageInfo.mimeType === 'image/jpeg' || imageInfo.mimeType === 'image/jpg') {
+                        image = await pdfDoc.embedJpg(buffer);
                     } else {
-                         image = await pdfDoc.embedJpg(buffer);
+                        console.warn(`Skipping unsupported image type for PDF: ${imageInfo.mimeType}`);
+                        continue; // Skip unsupported types for PDF
                     }
 
-                    const page = pdfDoc.addPage([image.width, image.height]);
-                    page.drawImage(image, {
-                        x: 0,
-                        y: 0,
-                        width: image.width,
-                        height: image.height,
-                    });
+                    const pdfPage = pdfDoc.addPage([image.width, image.height]);
+                    pdfPage.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+
+                } catch (pdfError) {
+                    console.error(`Failed to embed page ${img.page} into PDF:`, pdfError.message);
                 }
             }
             const pdfBytes = await pdfDoc.save();

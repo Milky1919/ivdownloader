@@ -6,7 +6,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Helper function to update status
     const updateStatus = (message, isError = false) => {
-        statusArea.textContent = message;
+        statusArea.innerHTML = message; // Use innerHTML to allow line breaks
         statusArea.style.color = isError ? 'red' : 'black';
     };
 
@@ -16,10 +16,24 @@ document.addEventListener('DOMContentLoaded', () => {
             const errorData = await response.json();
             throw new Error(errorData.error || 'Unknown error occurred.');
         }
+
         const disposition = response.headers.get('content-disposition');
-        const filename = disposition
-            ? disposition.split('filename=')[1].replace(/"/g, '')
-            : 'downloaded_file';
+        let filename = 'downloaded_file';
+        if (disposition) {
+            // Support for RFC 5987 `filename*=` (for UTF-8)
+            const utf8FilenameMatch = disposition.match(/filename\*=UTF-8''(.+)/);
+            if (utf8FilenameMatch && utf8FilenameMatch[1]) {
+                filename = decodeURIComponent(utf8FilenameMatch[1]);
+            } else {
+                // Fallback to `filename=`
+                const asciiFilenameMatch = disposition.match(/filename="(.+?)"/);
+                if (asciiFilenameMatch && asciiFilenameMatch[1]) {
+                    filename = asciiFilenameMatch[1];
+                }
+            }
+        }
+
+        const failedPages = response.headers.get('X-Failed-Pages');
 
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
@@ -30,22 +44,26 @@ document.addEventListener('DOMContentLoaded', () => {
         a.click();
         a.remove();
         window.URL.revokeObjectURL(url);
+
+        return { failedPages };
     };
 
     // Test Download Logic
     testButton.addEventListener('click', async () => {
         const formData = new FormData(form);
+        const groupName = formData.get('group_name');
+        const pdfId = formData.get('pdf');
         const pageRange = formData.get('page_range');
-        const firstPage = pageRange ? pageRange.split('-')[0] : null;
+        const firstPage = pageRange ? pageRange.split('-')[0].trim() : null;
 
-        if (!firstPage) {
-            updateStatus('Please enter a valid page or page range.', true);
+        if (!groupName || !pdfId || !firstPage) {
+            updateStatus('Please fill in Group Name, PDF ID, and Page Range.', true);
             return;
         }
 
         const data = {
-            group_name: formData.get('group_name'),
-            pdf: formData.get('pdf'),
+            group_name: groupName,
+            pdf: pdfId,
             page: parseInt(firstPage, 10),
             selector: formData.get('selector')
         };
@@ -89,8 +107,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)
             });
-            await handleFileResponse(response);
-            updateStatus('Batch download completed successfully!');
+
+            const { failedPages } = await handleFileResponse(response);
+
+            let statusMessage = 'Batch download completed successfully!';
+            if (failedPages) {
+                statusMessage += `<br><b>Warning:</b> Could not download the following pages: ${failedPages}`;
+            }
+            updateStatus(statusMessage);
+
         } catch (error) {
             updateStatus(`Error: ${error.message}`, true);
         }
